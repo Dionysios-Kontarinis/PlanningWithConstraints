@@ -1,0 +1,8 @@
+
+ATTENTION:
+==========
+
+The requirements of the "briefcase" domain (second line of the "briefcase.pddl" file) cannot be processed by
+the current version of this program, so a parsing error is generated. 
+
+==> To do in a future version...

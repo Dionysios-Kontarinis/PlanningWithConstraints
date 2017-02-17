@@ -1,0 +1,64 @@
+8
+
+dir
+18
+https://plansat.googlecode.com/svn/Plansat
+https://plansat.googlecode.com/svn
+
+
+
+2009-02-23T12:01:21.120704Z
+18
+julien.marcais@gmail.com
+
+
+svn:special svn:externals svn:needs-lock
+
+
+
+
+
+
+
+
+
+
+
+6bcfad38-fcfd-11dd-9d1a-b59b2e1864b6
+
+tasks_to_complete
+dir
+
+.classpath
+file
+
+
+
+
+2009-02-23T10:36:11.774185Z
+da7a5ed69cff3c5c38e1c5a0d2bfbbb3
+2009-02-20T13:03:03.140552Z
+11
+julien.marcais@gmail.com
+
+.project
+file
+
+
+
+
+2009-02-23T10:36:11.780185Z
+44f3b970af0b20f952e3a13cb0af583a
+2009-02-17T14:25:57.276843Z
+3
+julien.marcais@gmail.com
+
+src
+dir
+
+bin
+dir
+
+my_lib
+dir
+

@@ -1,0 +1,7 @@
+(define (problem cakeworld_pb1)
+   (:domain cakeworld)
+   (:requirements :strips :negative-preconditions)
+   (:objects only_cake)
+   (:init )
+   (:goal (have_e only_cake) ) 
+)

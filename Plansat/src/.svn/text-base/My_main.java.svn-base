@@ -1,0 +1,220 @@
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.util.BitSet;
+import java.util.Iterator;
+import java.util.Properties;
+
+import pddl4j.ErrorManager;
+import pddl4j.InvalidExpException;
+import pddl4j.PDDLObject;
+import pddl4j.Parser;
+import pddl4j.ErrorManager.Message;
+import pddl4j.exp.action.ActionDef;
+
+public class My_main {
+
+	public static void main(String[] args) {
+		// Checks the command line
+		if (args.length != 2) {
+			System.err.println("Invalid command line");
+		} else {
+			// Creates an instance of the java pddl parser
+			//////////////////////////////  ///////////////////////
+			//Properties pp = new Properties();
+			Properties pp = Parser.getDefaultOptions();
+			Parser parser = new Parser(pp); 
+			/////////////////////////////////////////////////////
+
+			PDDLObject domain = null;
+			//Domain domain = null;
+
+			try {
+				File f = new File(args[0]);
+				domain = parser.parse(f);
+			} catch (FileNotFoundException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+
+			PDDLObject problem = null;
+			//Problem problem = null;
+
+			try {
+				problem = parser.parse(new File(args[1]));
+			} catch (FileNotFoundException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+
+			System.out.println(domain);
+			System.out.println(problem);
+
+			PDDLObject obj = parser.link(domain, problem);
+			// Gets the error manager of the pddl parser
+			ErrorManager mgr = parser.getErrorManager();
+			// If the parser produces errors we print it and stop
+			if (mgr.contains(Message.ERROR)) {
+				mgr.print(Message.ALL);
+			} // else we print the warnings
+			else {
+				mgr.print(Message.WARNING);
+				System.out.println("\nParsing domain \"" + domain.getDomainName()
+						+ "\" done successfully ...");
+				System.out.println("Parsing problem \"" + problem.getProblemName()
+						+ "\" done successfully ...\n");
+			}
+
+			//System.out.println(" **** " +   domain   + " ****** "   );
+			//System.out.println(" **** " +   problem   + " ****** "   );
+			///////////////////////////////////////////////////////////////////////////////////////
+
+			int i=0;
+			Iterator iter = obj.actionsIterator();
+			while(iter.hasNext())
+			{
+				i++;
+				ActionDef action = (ActionDef) iter.next();
+				Iterator it = action.iterator(); // "it" --> Over the parameters of the ActionDef (Term)
+				while (it.hasNext())
+				{
+					System.out.println("PARAMETERS OF ACTION " + i + " (TERMS)" + " %%%%%%%% " +
+							it.next()  + " %%%%%%%%"   );
+				}
+				System.out.println("i = "+i+" **** " +    action  + " ****** "   );
+			}
+			///////////////////////////////////////////////////////////////////////////////////////
+			System.out.println("CONSTANTS: ");
+			i=0;
+			iter = obj.constantsIterator();
+			while(iter.hasNext())
+			{
+				i++;
+				System.out.println("i = "+i+" **** " +    iter.next()   + " ****** "   );
+			}
+			System.out.println();
+			////////////////////////////////////////////////////////////////////////////////////////
+			System.out.println("FUNCTIONS: ");
+			i=0;
+			iter = obj.functionsIterator();
+			while(iter.hasNext())
+			{
+				i++;
+				System.out.println("i = "+i+" **** " +    iter.next()   + " ***FUNCTIONS*** "   );
+			}
+			System.out.println();
+			////////////////////////////////////////////////////////////////////////////////////////
+			System.out.println("PREDICATES: ");
+			i=0;
+			iter = obj.predicatesIterator();
+			while(iter.hasNext())
+			{
+				i++;
+				System.out.println("i = "+i+" **** " +    iter.next()   + " ***PREDICATES*** "   );
+			}
+			System.out.println();
+
+			/*
+	        Iterator<ActionDef> itt = obj.actionsIterator();
+	        ActionDef action = itt.next();
+	        //System.out.println(action.);
+	        System.out.println(action);
+	        ActionDef action2 =action.standardize();
+	        System.out.println(action2.isGround());
+			 */
+
+			/////////////////////////////////////////////////////////////////////////////////////
+			/////////////////////////////////////////////////////////////////////////////////////
+
+			//  We search a solution in n=2 steps.
+			STRIPS2SAT plugin = new STRIPS2SAT(obj,2);
+
+			// Instantiate all facts:
+			plugin.initFacts();
+
+			// Testing the instantiated facts...
+			System.out.println("All completely instantiated facts: ");
+			for (int j=0; j<plugin.facts_table_size; j++) {
+				System.out.println(plugin.facts_table.get(j));
+			}
+			System.out.println("Total num of facts: " + plugin.facts_table_size);
+			System.out.println();
+
+			// Instantiate all actions:
+			try {
+				plugin.initOps();
+			} catch (InvalidExpException e) {
+				e.printStackTrace();
+			}
+
+			// Testing the instantiated actions...
+			System.out.println("All completely instantiated actions (operations):");
+			for (int j=0; j<plugin.ops_table_size; j++) {
+				//plugin.ops_table.get(j)
+				System.out.println(plugin.ops_table.get(j).getName());
+			}	
+			System.out.println();
+
+			/*
+			try {
+				////////////////////////
+				plugin.initGoals();
+
+				System.out.println("Num of goals: " + plugin.goals.length());
+				for (int j=0; j<plugin.goals.length(); j++)
+					System.out.println("YYYYY" + plugin.goals.get(j));
+				////////////////////////
+			} catch (InvalidExpException e1) {
+				// TODO Auto-generated catch block
+				e1.printStackTrace();
+			}
+			*/
+
+			///////////////////////////////////
+			// Performs some simple test (NOT READY!)
+			//plugin.testing_DimacsCNF();
+			///////////////////////////////////
+
+			// Here we try the solution! (creation of the dimacs file)...
+
+			try {
+				////////////////////////////
+				plugin.create_cnf_file();
+				////////////////////////////
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+			
+			System.out.println(plugin.ops_table.get(0).getName());
+			for (int j=0; j<plugin.ops_table.size(); j++)
+				System.out.println(plugin.ops_table.get(0).getPositiveEffect().get(j));
+			
+			
+			///Depart gestion et affichage du Goal
+			BitSet[] bs;
+			BitSet bsPos = new BitSet();
+			BitSet bsNeg = new BitSet();
+			try {
+				bs = Utilities.expToBitSet(problem.getGoal(), plugin.facts_table);
+				bsPos = bs[0];
+				bsNeg = bs[1];
+			} catch (InvalidExpException e) {
+				// TODO Auto-generated catch block
+				bsPos = null;
+				bsNeg = null;
+				e.printStackTrace();
+			}
+			System.out.println("");
+			System.out.println("Partie positive du goal : ");
+			for (int j = 0; j < bsPos.length(); j++) {
+				System.out.println(""+j+bsPos.get(j));
+			}
+			System.out.println("");
+			System.out.println("Partie negative du goal : ");
+			for (int j = 0; j < bsNeg.length(); j++) {
+				System.out.println(""+j+bsNeg.get(j));
+			}
+			///Fin gestion et affichage du Goal
+		}
+	}
+}

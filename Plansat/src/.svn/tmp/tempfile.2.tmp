@@ -1,0 +1,655 @@
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.HashSet;
+import java.util.Hashtable;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+import java.util.Stack;
+
+import pddl4j.InvalidExpException;
+import pddl4j.PDDLObject;
+import pddl4j.exp.AndExp;
+import pddl4j.exp.AtomicFormula;
+import pddl4j.exp.Exp;
+import pddl4j.exp.ExpID;
+import pddl4j.exp.InitEl;
+import pddl4j.exp.Literal;
+import pddl4j.exp.NotAtomicFormula;
+import pddl4j.exp.NotExp;
+import pddl4j.exp.action.Action;
+import pddl4j.exp.action.ActionDef;
+import pddl4j.exp.action.ActionID;
+import pddl4j.exp.fcomp.FCompExp;
+import pddl4j.exp.term.Constant;
+import pddl4j.exp.term.Substitution;
+import pddl4j.exp.term.Term;
+import pddl4j.exp.term.Variable;
+import pddl4j.graphplan.Fact;
+import pddl4j.graphplan.Op;
+
+/**
+ * This is the basic class which performs most tasks in order to 
+ * convert a plannification problem into a CSP problem. 
+ * 
+ */
+public class CNF_plugin 
+{
+	public PDDLObject problem;
+	public String solution; // The string which will contain the desired Dimacs-CNF format.
+	public File dimacs_cnf_file; // The file in which the result will be stored.
+	public ArrayList<Fact> facts_table;
+	public ArrayList<Op> ops_table; // actions_table;
+	public int facts_table_size;
+	public int ops_table_size; // actions_table_size;
+	
+	public int num_steps_inPlan;
+	
+	/*
+	 	//Its length is equal to the position of the last fact (instantiated) which holds
+	 	//in the goal position. Contains the info of which facts hold in the goal.
+	 public BitSet goals;
+	*/
+
+	/**
+	 *  goals[0] contains the positive preconditions of the goal
+	 *  and goals[1] contains the negative preconditions of the goal.
+	 */
+	public BitSet[] goals;
+
+	/**
+	 * CONSTRUCTOR
+	 * @param obj
+	 */
+	public CNF_plugin(PDDLObject obj, int num_steps) {
+		/**
+		 * The PDDLObject that represents the specific problem to solve.
+		 */
+		this.problem = obj;
+		this.solution = "";
+		this.facts_table = new ArrayList<Fact>();
+		this.ops_table = new ArrayList<Op>(1000);//////////////////////
+		this.facts_table_size = 0;
+		this.ops_table_size = 0;
+		this.num_steps_inPlan = num_steps;
+		
+	}
+	
+	/**
+     * Enumerates all the facts of the planning problem.
+     */
+	public void initFacts() {
+        this.facts_table =  new ArrayList<Fact>(100);
+        Iterator<AtomicFormula> i = this.problem.predicatesIterator();
+        while (i.hasNext()) {
+            AtomicFormula skeleton = i.next();
+            //args corresponds to the current skeleton
+            final List<Term> args = new ArrayList<Term>();
+            for (Term arg: skeleton) {
+                args.add(arg);
+            }
+            //args is built
+            this.instantiateFacts(skeleton, args, new Substitution());
+        }
+        this.facts_table_size = this.facts_table.size();
+    }
+	
+	/**
+     * Instantiates all the fact from a specific atomic formula skeleton of the
+     * problem.
+     * 
+     * @param skeleton the atomic formula skeleton to instantiate.
+     * @param args the list of arguments of the atomic formula skeleton not yet
+     *            instantiated.
+     * @param sigma the map containing for each argument already instantiated its
+     *            value.
+     */
+	// Called by the initFacts() function
+	private void instantiateFacts(final AtomicFormula skeleton,
+            						final List<Term> args,
+            						final Substitution sigma) {
+	    if (args.isEmpty()) {
+	        final Fact fact = new Fact(skeleton.apply(sigma), this.facts_table.size());
+	        this.facts_table.add(fact);
+	    } else {
+	        final Variable var = (Variable) args.get(0);
+	        final Set<Constant> values = this.problem.getTypedDomain(var.getTypeSet());
+	        for (Constant c : values) {
+	            sigma.bind(var, c);
+	            final List<Term> newArgs = new ArrayList<Term>(args);
+	            Term t = newArgs.remove(0);
+	            this.instantiateFacts(skeleton, newArgs, sigma);
+	        }
+	    }
+	}
+
+	/**
+     * Enumerates all the operators of the planning problem.
+     * 
+     * @throws InvalidExpException if an expression of an operator of the
+     *             problem is not an accepted pddl expression.
+     */
+    public void initOps() throws InvalidExpException {
+        // Generate the noop action first so a noop action as the same index as
+        // its corresponding fact.
+        	//for (int i = 0; i < this.facts_table_size; i++) {
+        	//    this.addNewNoOp(this.facts_table.get(i));
+        	//}
+        //this.ops_index = this.ops_table.size();
+        Iterator<ActionDef> i = this.problem.actionsIterator();
+        while (i.hasNext()) {
+            ActionDef a = i.next();
+            if (a.getActionID().equals(ActionID.ACTION)) {
+                Action op = (Action) a;
+                List<Term> parameters = new ArrayList<Term>(op.getParameters());
+                this.instantiateOps(op, parameters, new Substitution());
+            } 
+        }
+        this.ops_table_size = this.ops_table.size();
+    }
+    
+    /**
+     * Instantiates all the operator from a specific action of the problem.
+     * 
+     * @param action the atomic formula skeleton to instantiate.
+     * @param param the list of parameters of the action not yet instantiated.
+     * @param sigma the map containing for each parameter already instantiated its
+     *            value.
+     * @throws InvalidExpException if an invalid pddl expression is found in
+     *             the action.
+     */
+    private void instantiateOps(final Action action,
+                final List<Term> param,
+                final Substitution sigma)
+                throws InvalidExpException {
+
+        if (param.isEmpty()) {
+            this.addNewOp(action, sigma);
+        } else {
+            final Variable var = (Variable) param.get(0);
+            final Set<Constant> values = this.problem.getTypedDomain(var.getTypeSet());
+            for (Constant c : values) {
+                sigma.bind(var, c);
+                final List<Term> newParam = new ArrayList<Term>(param);
+                newParam.remove(0);
+                this.instantiateOps(action, newParam, sigma);
+            }
+        }
+    }
+	
+    /**
+     * Add a new op created from a specific pddl action.
+     * 
+     * @param action the action.
+     * @param sigma the mapping between the parameters and their values.
+     * @return <code>true</code> if a new op is added; <code>false</code> otherwise.
+     * @throws InvalidExpException if the unexpected pddl expression occurs in
+     *             the action definition.
+     */
+    private boolean addNewOp(Action action, Substitution sigma)
+                throws InvalidExpException {
+        boolean added = false;
+        AtomicFormula name = new AtomicFormula(action.getName());
+        for (Term p : action.getParameters()) {
+            name.add((Constant) sigma.getBinding((Variable) p));
+        }
+        BitSet[] pre = expToBitSet(action.getPrecondition().apply(sigma)); 
+        if (pre != null) {
+            BitSet[] eff = expToBitSet(action.getEffect().apply(sigma));
+            Op op = new Op(name, pre[0], pre[1], eff[0], eff[1], this.ops_table.size());
+            this.ops_table.add(op);
+            added = true;
+        } 
+        return added;
+
+    }
+
+    /**
+     * Transforms a pddl expression into a bit set representation.
+     * 
+     * @param exp the expression to transform.
+     * @return a array of bit set with a length of 2 such the first bit set
+     *         represents the positive fact of the expression and second bit set
+     *         that represents the negative fact of the expression.
+     * @throws InvalidExpException if an sub expression of the specified
+     *             expression is not valid.
+     */
+    private BitSet[] expToBitSet(final Exp exp) 
+            throws InvalidExpException {
+        BitSet[] bitSet = new BitSet[2]; 
+        bitSet[0] = new BitSet(this.facts_table_size);
+        bitSet[1] = new BitSet(this.facts_table_size);
+        HashSet<Literal> literals = null;
+        
+        literals = this.toLiteralSet(exp);
+        if (literals != null) {
+            for (Literal literal : literals) {
+                if (literal.getExpID().equals(ExpID.ATOMIC_FORMULA)) {
+                    AtomicFormula predicate = (AtomicFormula) literal;
+                    final int index = this.facts_table.indexOf(predicate);
+                    bitSet[0].set(index);
+                } else {
+                    NotAtomicFormula notExp = (NotAtomicFormula) literal;
+                    AtomicFormula predicate = (AtomicFormula) notExp.getExp();
+                    final int index = this.facts_table.indexOf(predicate);
+                    bitSet[1].set(index);
+                }
+            }
+        } else {
+            bitSet = null;
+        }
+        return bitSet;
+        
+    }
+    
+    /**
+     * Converts a ground pddl expression into a set of literals.
+     * 
+     * @param exp the expression that must be converted.
+     * @return a set of literal that represents the specified expression.
+     * @throws InvalidExpException if an sub expression of the specified
+     *             expression is not valid.
+     */
+    private HashSet<Literal> toLiteralSet(final Exp exp) throws InvalidExpException {
+        HashSet<Literal> literals = new HashSet<Literal>();
+
+        Stack<Exp> stack = new Stack<Exp>();
+        stack.add(exp);
+        boolean failure = false;
+        
+        while (!stack.isEmpty() && !failure) {
+            Exp e = stack.pop();
+            switch (e.getExpID()) {
+            case AND:
+                AndExp andExp = (AndExp) e;
+                for (Exp sexp : andExp) {
+                    stack.push(sexp);
+                }
+                break;
+            case ATOMIC_FORMULA:
+                AtomicFormula p = (AtomicFormula) e;
+                literals.add(p.clone());
+                break;
+            case F_COMP:
+                FCompExp fcomp = (FCompExp) e;
+                failure = !fcomp.evaluate();
+                break;
+            case NOT:
+                NotExp notExp = (NotExp) e;
+                Exp nexp = notExp.getExp();
+                switch (nexp.getExpID()) {
+                case F_COMP:
+                    fcomp = (FCompExp) nexp;
+                    failure = fcomp.evaluate();
+                    break;
+                default:
+                    HashSet<Literal> pl = toLiteralSet(notExp.getExp());
+                    if (pl != null) {
+                        for (Literal l : pl) {
+                            NotAtomicFormula f = new NotAtomicFormula((AtomicFormula) l);
+                            literals.add(f);
+                        }
+                     } else {
+                       failure = true;
+                     }
+                }
+                break;
+            default:
+                throw new InvalidExpException(exp.getExpID());
+            }
+        }
+        return failure ? null : literals;    
+    }
+   
+    /*
+     //Init the goals of the problem, i.e., converts the goal of the in a pddl
+     //format to inner format.
+     //@throws InvalidExpException if an invalid pddl expression is found in
+     //            the pddl goal description of the problem.
+    public void initGoals() throws InvalidExpException {
+        final Exp goal = this.problem.getGoal();
+        this.goals = new BitSet(this.facts_table_size);
+        if (goal.getExpID().equals(ExpID.AND)) {
+            final AndExp andExp = (AndExp) goal;
+            for (Exp e : andExp) {
+                if (e.getExpID().equals(ExpID.ATOMIC_FORMULA)) {
+                    final AtomicFormula predicate = (AtomicFormula) e;
+                    this.goals.set(this.facts_table.indexOf(predicate), true);
+                } else {
+                    throw new InvalidExpException(e.getExpID());
+                }
+            }
+        } else {
+            throw new InvalidExpException(goal.getExpID());
+        }
+    }
+    */
+    
+    // TO BE ERASED...
+    // It just performs some tests...
+    public void testing_DimacsCNF () {
+    	List<InitEl> initial_pos = this.problem.getInit();
+    	System.out.println("Testing the initial state...");
+    	for (int i=0; i<initial_pos.size(); i++) {
+    		System.out.println((AtomicFormula)initial_pos.get(i));
+    	}
+    	System.out.println();
+    	System.out.println("Searching for a match in the facts table...");
+    	for (int i=0; i<this.facts_table.size(); i++) {
+    		if (this.facts_table.get(i).equals(initial_pos.get(0)))
+    			System.out.println("Found the match: " + (AtomicFormula)initial_pos.get(0)
+    									+ " at position " + i + " of the facts table.");
+    	}
+    }
+    
+    /**
+     * Properly stores the positive and negative preconditions of the goal
+     * in the goals variable.
+     */
+    public void initializeGoals() throws InvalidExpException  {
+    	goals = Utilities.expToBitSet(problem.getGoal(), facts_table);
+    }
+    
+   /**
+    * Creates a new file in which we will write the Dimacs-CNF encoding of the problem.
+    * @throws IOException
+    */
+    public void create_cnf_file() throws IOException{
+    	//System.out.println("TRY");
+        dimacs_cnf_file = new File("dimacs-CNF_encoding.cnf");
+        //System.out.println("TRY2");
+        if(!dimacs_cnf_file.exists()){
+        	//System.out.println("TRY3");
+        	dimacs_cnf_file.createNewFile();
+        	System.out.println("New file \"dimacs-CNF_encoding.cnf\" has been created " 
+                              	+ "to the current directory, which is: "
+                              	+ dimacs_cnf_file.getCanonicalPath());
+        	System.out.println();
+        }
+        find_DimacsCNF_string();
+        write_cnf_file();
+        //////////////////
+        show_results();
+        //////////////////
+    }
+    
+    // Will be erased. Just for debugging...
+    private void show_results() {
+		System.out.println(solution);
+    }
+
+	/**
+     * This class writes the string containing the solution into the file. 
+     * @throws IOException
+     */
+    public void write_cnf_file() throws IOException{
+    	BufferedWriter output = new BufferedWriter(new FileWriter(dimacs_cnf_file));
+    	output.write(solution);
+    	output.close();
+    }
+    
+    /**
+     * Finds the Dimacs-CNF expression that corresponds to our problem.
+     * @return
+     */
+    public String find_DimacsCNF_string() {
+    	// Beginning of the file...
+    	solution = " c  This automatically generated file contains" 
+    			+ " the Dimacs-CNF format for the following context:" + "\r\n" 
+    			+ " c  Domain: " + problem.getDomainName() + "\r\n"
+    			+ " c  Problem: " + problem.getProblemName() + "\r\n"
+    			+ " p cnf " + findTotalDimacsIds()  + " ***TO DO: num of clauses "  + "*** " +  "\r\n ";
+    	
+    	// First we create the lines in the file that correspond to the Initial State of the problem...
+    	// The initial state has no "negative" statements...
+    	// If "not(something)" statements are to be included in the initial state then,
+    	// this method should be modified.
+    	// Here we are in: time step --> 0
+    	List<InitEl> inlist = problem.getInit();
+    	for (int i=0; i<inlist.size(); i++) { // for each "element" of the initial state...
+    		for (int j=0; j<facts_table.size(); j++) {
+        		if (facts_table.get(j).equals(inlist.get(i))) { // Find its "matching" entry in the facts table...
+        			solution = solution + findDimacsIdFact(j, 0) + " 0\r\n ";
+        			continue;
+        		}
+    		}
+    	}
+    	
+    	// Lines in the file corresponding to the Goal...
+    	// Here we are in: time step --> last time step 
+    	BitSet bs = goals[0]; // The positive preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			solution = solution + findDimacsIdFact(i, num_steps_inPlan) + " 0\r\n ";
+    		}
+    	}
+    	bs = goals[1]; // The negative preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			solution = solution + (-findDimacsIdFact(i, num_steps_inPlan)) + " 0\r\n ";
+    		}
+    	}
+    	
+    	// Stage 3....
+    	// Lines in the file corresponding to the schema: Action --> Preconds + Effects
+    	// (not(action) OR precond1) AND (not(action) OR precond2) AND ... AND (not(action) OR precondM)
+    	//  AND (not(action) OR effect1) AND (not(action) OR effect2) AND ... AND (not(action) OR effectN)
+    	for (int i=0; i<ops_table_size; i++) {
+    		for (int j=0; j<num_steps_inPlan; j++) {
+    			String operationCode = Integer.toString(-findDimacsIdOperation(i, j));
+    			bs = ops_table.get(i).getPositivePreconditon(); //// name!
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							findDimacsIdFact(k, j) + " 0\r\n ";
+    				}
+    			}
+    			bs = ops_table.get(i).getNegativePrecondition();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							(-findDimacsIdFact(k, j)) + " 0\r\n ";
+    				}
+    			}
+    			bs = ops_table.get(i).getPositiveEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							findDimacsIdFact(k, j+1) + " 0\r\n ";
+    				}
+    			}
+    			bs = ops_table.get(i).getNegativeEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							(-findDimacsIdFact(k, j+1)) + " 0\r\n ";
+    				}
+    			}
+    		}	
+    	}
+    	// Stage 4...
+    	// Lines in the file corresponding to the schema:
+    	// (FactA_timestepN) AND (not(FactA_timestepN+1)) --> Action_timestepN (a possible reason),
+    	// (not(FactA_timestepN)) AND (FactA_timestepN+1) --> Action_timestepN (a possible reason).
+    	
+    	
+    	
+    	
+		return solution;
+    }
+    
+    /**
+     * @param fact_id : the position of the fact in the facts table.
+     * @param timestep : The timestep in which the fact is having place.
+     * @return
+     */
+    private int findDimacsIdFact(int fact_id, int timestep) {
+    	// We use (timestep+1) since we begin by giving the id 1 (and not 0) to the first fact.
+		return ( fact_id*(num_steps_inPlan+1) + (timestep+1) );
+	} 
+    
+    /**
+     * @param op_id : the position of the operation in the operations table.
+     * @param timestep : The timestep in which the operation is having place.
+     * @return
+     */
+    private int findDimacsIdOperation(int op_id, int timestep) {
+		return ( findTotalDimacsIdsFact() + op_id*(num_steps_inPlan) + (timestep+1) );  
+	}
+    
+    /**
+     * Returns the total number of Dimacs Ids for all the facts.
+     */
+    private int findTotalDimacsIdsFact() {
+		return (this.facts_table_size)*(this.num_steps_inPlan + 1);
+	}
+    
+    /**
+     * Returns the total number of Dimacs Ids for all the operations.
+     */
+    private int findTotalDimacsIdsOperation() {
+		return (this.ops_table_size)*(this.num_steps_inPlan);
+	}
+
+	/**
+     * Returns the total number of Dimacs Ids 
+     * given to all facts and all operations (for all timesteps). 
+     * @return
+     */
+    public int findTotalDimacsIds() {
+    	return (this.facts_table_size)*(this.num_steps_inPlan + 1) + 
+    			(this.ops_table_size)*(this.num_steps_inPlan);	
+    }
+    
+    /**
+     * Returns the number of time steps that we use in order to find a solution.
+     * @return
+     */
+    public int get_numTimeSteps() {
+    	return this.num_steps_inPlan;
+    }
+    
+    /**
+     * Sets the number of time steps that we use in order to find a solution.
+     * @return
+     */
+    public void set_numTimeSteps(int n) {
+    	this.num_steps_inPlan = n; 
+    }
+    
+    
+    
+	/**
+	 * Encode a BitSet of a positive predicates conjunction to a list of the respective dimacs numbers.
+	 * @param bs Positives predicates BitSet.
+	 * @param stateNumber Represents the state of this predicate.
+	 * @return Integer list, each integer is a dimacs number.
+	 */
+	public List<Integer> encodePositiveDimacsPredicates(BitSet bs, int stateNumber){
+		List<Integer> l = new ArrayList<Integer>();
+		for (int i = 0; i < bs.size(); i++) {
+			if (bs.get(i)==true){
+				l.add(i*num_steps_inPlan+stateNumber+1);
+			}
+		}
+		return l;
+	}
+	
+	/**
+	 * Encode a BitSet of a positive actions conjunction to a list of the respective dimacs numbers.
+	 * @param bs Positives actions BitSet.
+	 * @param stateNumber Represents the state of this predicate.
+	 * @return Integer list, each integer is a dimacs number.
+	 */
+	public List<Integer> encodePositiveDimacsAction(BitSet bs, int stateNumber){
+		List<Integer> l = new ArrayList<Integer>();
+		for (int i = 0; i < bs.size(); i++) {
+			if (bs.get(i)==true){
+				l.add(i*num_steps_inPlan+stateNumber+1+facts_table_size*num_steps_inPlan);
+			}
+		}
+		return l;
+	}
+
+	/**
+	 * Encode a BitSet of a negative predicates conjunction to a list of the respective dimacs numbers.
+	 * @param bs Negatives predicates BitSet.
+	 * @param stateNumber Represents the state of this predicate.
+	 * @return Integer list, each integer is a dimacs number.
+	 */
+	public List<Integer> encodeNegativeDimacsPredicates(BitSet bs, int stateNumber){
+		List<Integer> l = new ArrayList<Integer>();
+		for (int i = 0; i < bs.size(); i++) {
+			if (bs.get(i)==true){
+				l.add((i*num_steps_inPlan+stateNumber-1)*(-1));
+			}
+		}
+		return l;
+	}
+	
+	/**
+	 * Encode a BitSet of a negative actions conjunction to a list of the respective dimacs numbers.
+	 * @param bs Negatives actions BitSet.
+	 * @param stateNumber Represents the state of this predicate.
+	 * @return Integer list, each integer is a dimacs number.
+	 */
+	public List<Integer> encodeNegativeDimacsAction(BitSet bs, int stateNumber){
+		List<Integer> l = new ArrayList<Integer>();
+		for (int i = 0; i < bs.size(); i++) {
+			if (bs.get(i)==true){
+				l.add((i*num_steps_inPlan+stateNumber-1-facts_table_size*num_steps_inPlan)*(-1));
+			}
+		}
+		return l;
+	}
+	
+	/**
+	 * Decode a dimacs number into an Integer list.<br>
+	 * The first number means :<br>
+	 * 0 for a fact.<br>
+	 * 1 for an action.<br>
+	 * The second number is the index in the right list (fact or action) of this element.
+	 * The last number is the state number of this element.
+	 * @param dimacsNumber Number from the dimacs file.
+	 * @return An Integer list.
+	 */
+	public List<Integer> decodeDimacsNumber(int dimacsNumber){
+		List<Integer> l = new ArrayList<Integer>();
+		
+		//First part : the number is a fact
+		if ((dimacsNumber>0)&&(dimacsNumber<num_steps_inPlan*facts_table_size+1)){
+			l.add(0);
+			l.add((dimacsNumber-1)/num_steps_inPlan);
+			l.add((dimacsNumber-1)-(l.get(0)*num_steps_inPlan));			
+		}
+		else if((dimacsNumber<0)&&(dimacsNumber>(-1)*num_steps_inPlan*facts_table_size-1)){
+			l.add(0);
+			l.add((dimacsNumber+1)/num_steps_inPlan);
+			l.add((dimacsNumber+1)-(l.get(0)*num_steps_inPlan));	
+		}
+		
+		//Second part : the number is an action
+		else if (dimacsNumber>0){
+			dimacsNumber -= num_steps_inPlan*facts_table_size;
+			l.add(1);
+			l.add((dimacsNumber-1)/num_steps_inPlan);
+			l.add((dimacsNumber-1)-(l.get(0)*num_steps_inPlan));
+		}
+		else if (dimacsNumber<0){
+			l.add(1);
+			l.add((dimacsNumber+1)/num_steps_inPlan);
+			l.add((dimacsNumber+1)-(l.get(0)*num_steps_inPlan));
+		}
+		
+		//Third part : the number is 0 => not a Dimacs Number
+		else {
+			System.out.println("Error");
+		}
+		return l;
+	}
+       
+}

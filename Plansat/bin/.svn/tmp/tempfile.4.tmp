@@ -1,0 +1,1656 @@
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.BitSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+import java.util.Stack;
+
+import org.sat4j.core.VecInt;
+import org.sat4j.minisat.SolverFactory;
+import org.sat4j.specs.ContradictionException;
+import org.sat4j.specs.IProblem;
+import org.sat4j.specs.ISolver;
+import org.sat4j.specs.TimeoutException;
+
+import pddl4j.InvalidExpException;
+import pddl4j.PDDLObject;
+import pddl4j.exp.AndExp;
+import pddl4j.exp.AtomicFormula;
+import pddl4j.exp.Exp;
+import pddl4j.exp.ExpID;
+import pddl4j.exp.InitEl;
+import pddl4j.exp.Literal;
+import pddl4j.exp.NotAtomicFormula;
+import pddl4j.exp.NotExp;
+import pddl4j.exp.action.Action;
+import pddl4j.exp.action.ActionDef;
+import pddl4j.exp.action.ActionID;
+import pddl4j.exp.fcomp.FCompExp;
+import pddl4j.exp.term.Constant;
+import pddl4j.exp.term.Substitution;
+import pddl4j.exp.term.Term;
+import pddl4j.exp.term.Variable;
+import pddl4j.graphplan.Fact;
+import pddl4j.graphplan.Op;
+
+/**
+ * Performs most tasks in order to convert a planification problem (expressed in the form of a
+ * PDDLObject) into a CSP problem. It also finds a solution to this problem using the SAT4J library. 
+ */
+public class CNF_plugin 
+{
+	/**
+	 * The planification problem we wish to solve which is the result of parsing the domain 
+	 * and the specific problem, and then linking them.
+	 */
+	public PDDLObject problem;
+	
+	/*
+ 	//Its length is equal to the position of the last fact (instantiated) which holds
+ 	//in the goal position. Contains the info of which facts hold in the goal.
+ 	public BitSet goals;
+	*/
+	
+	/**
+	 *  goals[0] contains the positive preconditions of the goal
+	 *  and goals[1] contains the negative preconditions of the goal.
+	 */
+	public BitSet[] goals;
+	
+	/**
+	 * Contains all grounded facts of the problem.
+	 */
+	public ArrayList<Fact> facts_table;
+	
+	/**
+	 * Contains all grounded actions (operations) of the problem.
+	 */
+	public ArrayList<Op> ops_table;
+	
+	/**
+	 * The total number of grounded facts.
+	 */
+	public int facts_table_size;
+	
+	/**
+	 * The total number of grounded actions (operations).
+	 */
+	public int ops_table_size;
+	
+	/**
+	 * The maximum number of steps of a solution (plan) for which the solution is accepted.
+	 */
+	public int num_steps_inPlan;
+	
+	/**
+	 * The string which contains the translation of our problem into Dimacs-CNF format.
+	 */
+	public String solution;
+	
+	/**
+	 * The file in which the solution (string in Dimacs-CNF format) will be stored.
+	 */
+	public File dimacs_cnf_file;
+	
+	/**
+	 * The flag used to indicate if time must be displayed.
+	 */
+	public boolean dispTime ;
+	
+	//public int totalDimacsIdsFact;
+	
+	
+	/**
+	 * CONSTRUCTOR
+	 * @param obj 
+	 * 			The problem to solve expressed in the form of a PDDLObject
+	 * @param num_steps
+	 * 			The maximum number of steps that we accept in the solution.
+	 */
+	public CNF_plugin(PDDLObject obj, int num_steps) {
+
+		this.problem = obj;
+		this.solution = "";
+		this.facts_table = new ArrayList<Fact>();
+		this.ops_table = new ArrayList<Op>(1000); //
+		this.facts_table_size = 0;
+		this.ops_table_size = 0;
+		this.num_steps_inPlan = num_steps;
+		//totalDimacsIdsFact = findTotalDimacsIds();	
+	}
+	
+	///////////////////////////////////////////////////////////////////////////////////////////////
+	//									"UTILITY" METHODS (START)
+	
+	/**
+     * Enumerates all the facts of the planning problem.
+     */
+	public void initFacts() {
+        this.facts_table =  new ArrayList<Fact>(100);
+        Iterator<AtomicFormula> i = this.problem.predicatesIterator();
+        while (i.hasNext()) {
+            AtomicFormula skeleton = i.next();
+            //args corresponds to the current skeleton
+            final List<Term> args = new ArrayList<Term>();
+            for (Term arg: skeleton) {
+                args.add(arg);
+            }
+            //args is built
+            this.instantiateFacts(skeleton, args, new Substitution());
+        }
+        this.facts_table_size = this.facts_table.size();
+    }
+	
+	/**
+     * Instantiates all the fact from a specific atomic formula skeleton of the
+     * problem.
+     * 
+     * @param skeleton the atomic formula skeleton to instantiate.
+     * @param args the list of arguments of the atomic formula skeleton not yet
+     *            instantiated.
+     * @param sigma the map containing for each argument already instantiated its
+     *            value.
+     */
+	// Called by the initFacts() function
+	private void instantiateFacts(final AtomicFormula skeleton,
+            						final List<Term> args,
+            						final Substitution sigma) {
+	    if (args.isEmpty()) {
+	        final Fact fact = new Fact(skeleton.apply(sigma), this.facts_table.size());
+	        this.facts_table.add(fact);
+	    } else {
+	        final Variable var = (Variable) args.get(0);
+	        final Set<Constant> values = this.problem.getTypedDomain(var.getTypeSet());
+	        for (Constant c : values) {
+	            sigma.bind(var, c);
+	            final List<Term> newArgs = new ArrayList<Term>(args);
+	            Term t = newArgs.remove(0);
+	            this.instantiateFacts(skeleton, newArgs, sigma);
+	        }
+	    }
+	}
+
+	/**
+     * Enumerates all the operators of the planning problem.
+     * 
+     * @throws InvalidExpException if an expression of an operator of the
+     *             problem is not an accepted pddl expression.
+     */
+    public void initOps() throws InvalidExpException {
+        // Generate the noop action first so a noop action as the same index as
+        // its corresponding fact.
+        	//for (int i = 0; i < this.facts_table_size; i++) {
+        	//    this.addNewNoOp(this.facts_table.get(i));
+        	//}
+        //this.ops_index = this.ops_table.size();
+        Iterator<ActionDef> i = this.problem.actionsIterator();
+        while (i.hasNext()) {
+            ActionDef a = i.next();
+            if (a.getActionID().equals(ActionID.ACTION)) {
+                Action op = (Action) a;
+                List<Term> parameters = new ArrayList<Term>(op.getParameters());
+                this.instantiateOps(op, parameters, new Substitution());
+            } 
+        }
+        this.ops_table_size = this.ops_table.size();
+    }
+    
+    /**
+     * Instantiates all the operator from a specific action of the problem.
+     * 
+     * @param action the atomic formula skeleton to instantiate.
+     * @param param the list of parameters of the action not yet instantiated.
+     * @param sigma the map containing for each parameter already instantiated its
+     *            value.
+     * @throws InvalidExpException if an invalid pddl expression is found in
+     *             the action.
+     */
+    private void instantiateOps(final Action action,
+                final List<Term> param,
+                final Substitution sigma)
+                throws InvalidExpException {
+
+        if (param.isEmpty()) {
+            this.addNewOp(action, sigma);
+        } else {
+            final Variable var = (Variable) param.get(0);
+            final Set<Constant> values = this.problem.getTypedDomain(var.getTypeSet());
+            for (Constant c : values) {
+                sigma.bind(var, c);
+                final List<Term> newParam = new ArrayList<Term>(param);
+                newParam.remove(0);
+                this.instantiateOps(action, newParam, sigma);
+            }
+        }
+    }
+	
+    /**
+     * Add a new op created from a specific pddl action.
+     * 
+     * @param action the action.
+     * @param sigma the mapping between the parameters and their values.
+     * @return <code>true</code> if a new op is added; <code>false</code> otherwise.
+     * @throws InvalidExpException if the unexpected pddl expression occurs in
+     *             the action definition.
+     */
+    private boolean addNewOp(Action action, Substitution sigma)
+                throws InvalidExpException {
+        boolean added = false;
+        AtomicFormula name = new AtomicFormula(action.getName());
+        for (Term p : action.getParameters()) {
+            name.add((Constant) sigma.getBinding((Variable) p));
+        }
+        BitSet[] pre = expToBitSet(action.getPrecondition().apply(sigma)); 
+        if (pre != null) {
+            BitSet[] eff = expToBitSet(action.getEffect().apply(sigma));
+            Op op = new Op(name, pre[0], pre[1], eff[0], eff[1], this.ops_table.size());
+            this.ops_table.add(op);
+            added = true;
+        } 
+        return added;
+
+    }
+
+    /**
+     * Transforms a pddl expression into a bit set representation.
+     * 
+     * @param exp the expression to transform.
+     * @return a array of bit set with a length of 2 such the first bit set
+     *         represents the positive fact of the expression and second bit set
+     *         that represents the negative fact of the expression.
+     * @throws InvalidExpException if an sub expression of the specified
+     *             expression is not valid.
+     */
+    private BitSet[] expToBitSet(final Exp exp) 
+            throws InvalidExpException {
+        BitSet[] bitSet = new BitSet[2]; 
+        bitSet[0] = new BitSet(this.facts_table_size);
+        bitSet[1] = new BitSet(this.facts_table_size);
+        HashSet<Literal> literals = null;
+        
+        literals = this.toLiteralSet(exp);
+        if (literals != null) {
+            for (Literal literal : literals) {
+                if (literal.getExpID().equals(ExpID.ATOMIC_FORMULA)) {
+                    AtomicFormula predicate = (AtomicFormula) literal;
+                    final int index = this.facts_table.indexOf(predicate);
+                    bitSet[0].set(index);
+                } else {
+                    NotAtomicFormula notExp = (NotAtomicFormula) literal;
+                    AtomicFormula predicate = (AtomicFormula) notExp.getExp();
+                    final int index = this.facts_table.indexOf(predicate);
+                    bitSet[1].set(index);
+                }
+            }
+        } else {
+            bitSet = null;
+        }
+        return bitSet;
+        
+    }
+    
+    /**
+     * Converts a ground pddl expression into a set of literals.
+     * 
+     * @param exp the expression that must be converted.
+     * @return a set of literal that represents the specified expression.
+     * @throws InvalidExpException if an sub expression of the specified
+     *             expression is not valid.
+     */
+    private HashSet<Literal> toLiteralSet(final Exp exp) throws InvalidExpException {
+        HashSet<Literal> literals = new HashSet<Literal>();
+
+        Stack<Exp> stack = new Stack<Exp>();
+        stack.add(exp);
+        boolean failure = false;
+        
+        while (!stack.isEmpty() && !failure) {
+            Exp e = stack.pop();
+            switch (e.getExpID()) {
+            case AND:
+                AndExp andExp = (AndExp) e;
+                for (Exp sexp : andExp) {
+                    stack.push(sexp);
+                }
+                break;
+            case ATOMIC_FORMULA:
+                AtomicFormula p = (AtomicFormula) e;
+                literals.add(p.clone());
+                break;
+            case F_COMP:
+                FCompExp fcomp = (FCompExp) e;
+                failure = !fcomp.evaluate();
+                break;
+            case NOT:
+                NotExp notExp = (NotExp) e;
+                Exp nexp = notExp.getExp();
+                switch (nexp.getExpID()) {
+                case F_COMP:
+                    fcomp = (FCompExp) nexp;
+                    failure = fcomp.evaluate();
+                    break;
+                default:
+                    HashSet<Literal> pl = toLiteralSet(notExp.getExp());
+                    if (pl != null) {
+                        for (Literal l : pl) {
+                            NotAtomicFormula f = new NotAtomicFormula((AtomicFormula) l);
+                            literals.add(f);
+                        }
+                     } else {
+                       failure = true;
+                     }
+                }
+                break;
+            default:
+                throw new InvalidExpException(exp.getExpID());
+            }
+        }
+        return failure ? null : literals;    
+    }
+    
+    /**
+     * Properly stores the positive and negative preconditions of the goal
+     * in the goals variable.
+     */
+    public void initializeGoals() throws InvalidExpException  {
+    	goals = Utilities.expToBitSet(problem.getGoal(), facts_table);
+    }
+    
+    /*
+     //Init the goals of the problem, i.e., converts the goal of the in a pddl
+     //format to inner format.
+     //@throws InvalidExpException if an invalid pddl expression is found in
+     //            the pddl goal description of the problem.
+    public void initGoals() throws InvalidExpException {
+        final Exp goal = this.problem.getGoal();
+        this.goals = new BitSet(this.facts_table_size);
+        if (goal.getExpID().equals(ExpID.AND)) {
+            final AndExp andExp = (AndExp) goal;
+            for (Exp e : andExp) {
+                if (e.getExpID().equals(ExpID.ATOMIC_FORMULA)) {
+                    final AtomicFormula predicate = (AtomicFormula) e;
+                    this.goals.set(this.facts_table.indexOf(predicate), true);
+                } else {
+                    throw new InvalidExpException(e.getExpID());
+                }
+            }
+        } else {
+            throw new InvalidExpException(goal.getExpID());
+        }
+    }
+    */
+    
+    //									"UTILITY" METHODS (END)
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+										
+    
+    // TO BE ERASED...
+    // It just performs some tests...
+    public void testing_DimacsCNF() {
+    	List<InitEl> initial_pos = this.problem.getInit();
+    	System.out.println("Testing the initial state...");
+    	for (int i=0; i<initial_pos.size(); i++) {
+    		System.out.println((AtomicFormula)initial_pos.get(i));
+    	}
+    	System.out.println();
+    	System.out.println("Searching for a match in the facts table...");
+    	for (int i=0; i<this.facts_table.size(); i++) {
+    		if (this.facts_table.get(i).equals(initial_pos.get(0)))
+    			System.out.println("Found the match: " + (AtomicFormula)initial_pos.get(0)
+    									+ " at position " + i + " of the facts table.");
+    	}
+    }
+    
+   /**
+    * Creates a new file in which we will write the Dimacs-CNF encoding of the problem.
+    * We usually call whether this method or the findSolution() method.
+    * @throws IOException
+    */
+    public void create_cnf_file() throws IOException{
+    	
+        dimacs_cnf_file = new File("dimacs-CNF_encoding.cnf");
+        if(!dimacs_cnf_file.exists()){
+        	dimacs_cnf_file.createNewFile();
+        	System.out.println("New file \"dimacs-CNF_encoding.cnf\" has been created " 
+                              	+ "to the current directory, which is: "
+                              	+ dimacs_cnf_file.getCanonicalPath());
+        	System.out.println();
+        }
+        find_DimacsCNF_string();
+        write_cnf_file();
+        //////////////////
+        show_results();
+        //////////////////
+    }
+    
+    
+    // Will be erased. Just for debugging...
+    private void show_results() {
+		System.out.println(solution);
+    }
+
+    
+	/**
+     * This class writes the string containing the solution into the file. 
+     * @throws IOException
+     */
+    public void write_cnf_file() throws IOException{
+    	BufferedWriter output = new BufferedWriter(new FileWriter(dimacs_cnf_file));
+    	output.write(solution);
+    	output.close();
+    }
+    
+    /**
+     * Finds the Dimacs-CNF expression that corresponds to our problem.
+     * @return
+     * 		the solution in Dimacs-CNF format.
+     */
+    public String find_DimacsCNF_string() {
+    	// The number of clauses contained in the string solution.
+    	int num_of_clauses = 0;
+    	
+    	// Beginning of the file...
+    	solution = " c  This automatically generated file contains" 
+    			+ " the Dimacs-CNF format for the following context:" + "\r\n" 
+    			+ " c  Domain: " + problem.getDomainName() + "\r\n"
+    			+ " c  Problem: " + problem.getProblemName() + "\r\n"
+    			+ " p cnf " + findTotalDimacsIdsRegularEncoding() + "\r\n ";
+    	
+    	///////////////////////////
+    	// STAGE 1 (Initial State):
+    	///////////////////////////
+    	
+    	// First we create the lines in the file that correspond to the Initial State of the problem...
+    	// The initial state has no "negative" statements...
+    	// If "not(something)" statements are to be included in the initial state then,
+    	// this method should be modified.
+    	// We have: time step --> 0
+    	
+    	/*
+    	List<InitEl> inlist = problem.getInit();
+    	for (int i=0; i<inlist.size(); i++) { // for each "element" of the initial state...
+    		for (int j=0; j<facts_table.size(); j++) {
+        		if (facts_table.get(j).equals(inlist.get(i))) { // Find its "matching" entry in the facts table...
+        			solution = solution + findDimacsIdFact(j, 0) + " 0\r\n ";
+        			num_of_clauses++;
+        			continue;
+        		} 
+        		else {
+        			solution = solution + (-findDimacsIdFact(j, 0)) + " 0\r\n ";
+        			num_of_clauses++;
+        			continue;
+        		}
+        		
+    		}	
+    	}
+    	*/
+    	
+    	List<InitEl> inlist = problem.getInit();
+    	for (int i=0; i<facts_table.size(); i++) { // for each fact
+    		boolean isInit = false;
+    		for (int j=0; j<inlist.size(); j++) { // for each "element" of the initial state...
+    		
+        		if (facts_table.get(i).equals(inlist.get(j))) { // Find its "matching" entry in the facts table...
+        			solution = solution + findDimacsIdFact(i, 0) + " 0\r\n ";
+        			num_of_clauses++;
+        			isInit = true ;
+        			continue;
+        		} 
+    		}
+    		if (!isInit){
+    			solution = solution + (-findDimacsIdFact(i, 0)) + " 0\r\n ";
+    			num_of_clauses++;
+    		}
+    	}
+    	
+    	/////////////////////////
+    	// STAGE 2 (Goal State):
+    	/////////////////////////
+    	
+    	// Lines in the file corresponding to the Goal State...
+    	// We have: time step --> last time step 
+    	BitSet bs = goals[0]; // The positive preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			solution = solution + findDimacsIdFact(i, num_steps_inPlan) + " 0\r\n ";
+    			num_of_clauses++;
+    		}
+    	}
+    	bs = goals[1]; // The negative preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			solution = solution + (-findDimacsIdFact(i, num_steps_inPlan)) + " 0\r\n ";
+    			num_of_clauses++;
+    		}
+    	}
+    	
+    	///////////////////////////////////
+    	// STAGE 3 (Definition of actions):
+    	///////////////////////////////////
+    	
+    	// Lines in the file corresponding to the schema: Action --> Preconds + Effects
+    	// (not(action) OR precond1) AND (not(action) OR precond2) AND ... AND (not(action) OR precondM)
+    	//  AND (not(action) OR effect1) AND (not(action) OR effect2) AND ... AND (not(action) OR effectN)
+    	for (int i=0; i<ops_table_size; i++) {
+    		for (int j=0; j<num_steps_inPlan; j++) {
+    			String operationCode = Integer.toString(-findDimacsIdOperationRegularEncoding(i, j));
+    			bs = ops_table.get(i).getPositivePreconditon(); //// shoult be "-tion"...
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							findDimacsIdFact(k, j) + " 0\r\n ";
+    					num_of_clauses++;
+    				}
+    			}
+    			bs = ops_table.get(i).getNegativePrecondition();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							(-findDimacsIdFact(k, j)) + " 0\r\n ";
+    					num_of_clauses++;
+    				}
+    			}
+    			bs = ops_table.get(i).getPositiveEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							findDimacsIdFact(k, j+1) + " 0\r\n ";
+    					num_of_clauses++;
+    				}
+    			}
+    			bs = ops_table.get(i).getNegativeEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					solution = solution + operationCode + " " +
+							(-findDimacsIdFact(k, j+1)) + " 0\r\n ";
+    					num_of_clauses++;
+    				}
+    			}
+    		}	
+    	}
+    	
+    	//////////////////////////////////////
+    	// STAGE 4 (Explanatory Frame Axioms):
+    	//////////////////////////////////////
+    	
+    	// Lines in the file corresponding to the schema:
+    	// (FactA_timestepN) AND (not(FactA_timestepN+1)) --> Action_timestepN (a possible reason),
+    	// (not(FactA_timestepN)) AND (FactA_timestepN+1) --> Action_timestepN (a possible reason).
+    	boolean isEffect = false;
+    	for (int i=0; i<facts_table_size; i++) {
+    		for (int j=0; j<ops_table_size; j++) {
+    			if (ops_table.get(j).getPositiveEffect().get(i)) {
+    				isEffect = true;
+    			}
+    		}
+    		// If we found out that for a specific fact, there exists at least one action that has it as
+    		// a POSITIVE EFFECT, then we will have to add new clauses to the solution.
+    		// The pattern is:
+    		// 		FactA OR (NOT FactB) OR ActionA OR ActionB OR ...
+    		if (isEffect) {
+    			for (int t=0; t<get_numTimeSteps(); t++) {
+    				solution = solution + findDimacsIdFact(i, t) + " " +
+						(-findDimacsIdFact(i, t+1));
+    				for (int j=0; j<ops_table_size; j++) {
+    	    			if (ops_table.get(j).getPositiveEffect().get(i)) {
+    	    				solution = solution + " " + findDimacsIdOperationRegularEncoding(j, t); 
+    	    			}
+    	    		}
+    				solution = solution + " 0\r\n ";
+    				num_of_clauses++;
+    			}
+    		}					
+    	}	
+    	isEffect = false;
+    	for (int i=0; i<facts_table_size; i++) {
+    		for (int j=0; j<ops_table_size; j++) {
+    			if (ops_table.get(j).getNegativeEffect().get(i)) {
+    				isEffect = true;
+    			}
+    		}
+    		// If we found out that for a specific fact, there exists at least one action that has it as
+    		// a negative effect, then we will have to add new clauses to the solution.
+    		// The pattern is:
+    		// 		(NOT FactA) OR FactB OR ActionA OR ActionB OR ...
+    		if (isEffect) {
+    			for (int t=0; t<get_numTimeSteps(); t++) {
+    				solution = solution + (-findDimacsIdFact(i, t)) + " " +
+						findDimacsIdFact(i, t+1);
+    				for (int j=0; j<ops_table_size; j++) {
+    	    			if (ops_table.get(j).getNegativeEffect().get(i)) {
+    	    				solution = solution + " " + findDimacsIdOperationRegularEncoding(j, t); 
+    	    			}
+    	    		}
+    				solution = solution + " 0\r\n ";
+    				num_of_clauses++;
+    			}
+    		}					
+    	}
+    	
+    	///////////////////////////////////////
+    	// STAGE 5 (Complete Exclusion Axioms):
+    	///////////////////////////////////////
+    	
+    	// Two actions cannot be executed in the same timestep.
+    	for (int i=0; i<get_numTimeSteps(); i++) {
+    		for (int j=0; j<ops_table_size; j++) {
+    			for (int k=j+1; k<ops_table_size; k++) {
+    				solution = solution + (-findDimacsIdOperationRegularEncoding(j, i)) + " " +
+    					(-findDimacsIdOperationRegularEncoding(k, i)) + " 0\r\n ";
+    				num_of_clauses++;
+    			}
+    		}	
+        }
+
+    	// Adds the number of clauses in the proper place (p cnf num_vars num_clauses)
+    	this.addNumOfClauses(num_of_clauses);
+    	
+		return solution;
+    }
+    
+    /**
+     * Adds the number of clauses in the beginning of the solution string.
+     * @param number_of_clauses
+     */
+    private void addNumOfClauses(int number_of_clauses) {
+    	String temp = solution;
+		int cut = 0;
+		int cutsum = 0;
+		for (int i=0; i<4; i++) {
+			cut = temp.indexOf("\r\n");
+			cutsum += cut+2;
+			temp = temp.substring(cut+2);
+		}
+		solution = solution.substring(0, cutsum-2) + " " + number_of_clauses + "\r\n" + temp;
+	}
+    
+    /**
+     * Finds and displays solution to our problem, provided that there exists one.
+     * Otherwise, it declares the problem unsatisfiable.
+     * The sat4j library is used to find the solution.
+     * @return
+     * @throws ContradictionException 
+     * @throws TimeoutException 
+     */
+    public void findSolution() throws ContradictionException, TimeoutException {
+<<<<<<< .mine
+    	// Variable used to print the time lengths of the different steps 
+    	// of the findSolution process.
+    	long currentTimeNano = System.nanoTime();
+=======
+    	long startTime = System.nanoTime();
+//    	if (this.dispTime){
+//    		Main_DimacsCNF.displayTime("BEGIN", (System.nanoTime() - startTime)/1000000);
+//    		startTime = System.nanoTime();
+//    	}
+//    	System.out.println("############# BEGIN " + (System.nanoTime() - startTime)/1000000);
+>>>>>>> .r41
+    	
+    	final int MAXVAR = 1000000;
+		final int NBCLAUSES = 500000;
+		
+		// We create a table of integers which holds the solution.
+		// It contains positive and negative integers.
+		int[] mysolution = null;
+		
+		ISolver solver = SolverFactory.newDefault();
+		//  prepare the solver to accept MAXVAR variables. MANDATORY
+		solver.newVar(MAXVAR);
+		// not mandatory for SAT solving. MANDATORY for MAXSAT solving
+		solver.setExpectedNumberOfClauses(NBCLAUSES);
+		// Feed the solver using Dimacs format, using arrays of int
+		// (best option to avoid dependencies on SAT4J IVecInt)
+		
+		/**
+		 * We will use this variable in order to build all necessary clauses (one by one).
+		 */
+		VecInt clause;
+    	
+    	// STAGE 1 (Initial State):
+    	List<InitEl> inlist = problem.getInit();
+    	for (int i=0; i<facts_table.size(); i++) { // for each fact
+    		boolean isInit = false;
+    		for (int j=0; j<inlist.size(); j++) { // for each "element" of the initial state...
+    		
+        		if (facts_table.get(i).equals(inlist.get(j))) { // Find its "matching" entry in the facts table...
+        			clause = new VecInt(new int[]{findDimacsIdFact(i, 0)});
+        			solver.addClause(clause);
+        				//System.out.println(clause);
+        			isInit = true ;
+        			continue;
+        		} 
+    		}
+    		if (!isInit){
+    			clause = new VecInt(new int[]{-findDimacsIdFact(i, 0)});
+    			solver.addClause(clause);
+    				//System.out.println(clause);
+    		}
+    	}
+    	// STAGE 2 (Goal State):
+    	BitSet bs = goals[0]; // The positive preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			clause = new VecInt(new int[]{findDimacsIdFact(i, num_steps_inPlan)});
+    			solver.addClause(clause);
+    				//System.out.println(clause);
+    		}
+    	}
+    	bs = goals[1]; // The negative preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			clause = new VecInt(new int[]{-findDimacsIdFact(i, num_steps_inPlan)});
+    			solver.addClause(clause);
+    				//System.out.println(clause);
+    		}
+    	}
+    	// STAGE 3 (Definition of actions):
+    	for (int i=0; i<ops_table_size; i++) {
+    		for (int j=0; j<num_steps_inPlan; j++) {
+    			int operationCode = -findDimacsIdOperationRegularEncoding(i, j);
+    			bs = ops_table.get(i).getPositivePreconditon(); //// shoult be "-tion"...
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					clause = new VecInt(new int[]{operationCode, findDimacsIdFact(k, j)});
+    	    			solver.addClause(clause);
+    	    				//System.out.println(clause);
+    				}
+    			}
+    			bs = ops_table.get(i).getNegativePrecondition();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					clause = new VecInt(new int[]{operationCode, -findDimacsIdFact(k, j)});
+    					solver.addClause(clause);
+    						//System.out.println(clause);
+    				}
+    			}
+    			bs = ops_table.get(i).getPositiveEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					clause = new VecInt(new int[]{operationCode, findDimacsIdFact(k, j+1)});
+    					solver.addClause(clause);
+    						//System.out.println(clause);
+    				}
+    			}
+    			bs = ops_table.get(i).getNegativeEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					clause = new VecInt(new int[]{operationCode, -findDimacsIdFact(k, j+1)});
+    					solver.addClause(clause);
+    						//System.out.println(clause);
+    				}
+    			}
+    		}	
+    	}
+    	// STAGE 4 (Explanatory Frame Axioms):
+    	ArrayList<Integer> sol;
+    	boolean isEffect = false;
+    	// Check the POSITIVE EFFECTS OF ACTIONS
+    	for (int i=0; i<facts_table_size; i++) {
+    		for (int j=0; j<ops_table_size; j++) {
+    			if (ops_table.get(j).getPositiveEffect().get(i)) {
+    				isEffect = true;
+    			}
+    		}
+    		if (isEffect) {
+    			for (int t=0; t<get_numTimeSteps(); t++) {
+    				sol = new ArrayList<Integer>();
+    				sol.add(findDimacsIdFact(i, t));
+    				sol.add(-findDimacsIdFact(i, t+1));
+    				for (int j=0; j<ops_table_size; j++) {
+    	    			if (ops_table.get(j).getPositiveEffect().get(i)) {
+    	    				sol.add(findDimacsIdOperationRegularEncoding(j, t)); 
+    	    			}
+    	    		}
+    				// Create the array from the ArrayList
+    				int[] mat = new int[sol.size()];
+    				for (int l=0; l<sol.size(); l++) {
+    					mat[l] = sol.get(l);	
+    				}
+    				// Add the found clause to the solution
+    				clause = new VecInt(mat);
+					solver.addClause(clause);
+						//System.out.println(clause);
+    			}
+    		}					
+    	}	
+    	sol = new ArrayList<Integer>();
+    	isEffect = false;
+    	// Check the NEGATIVE EFFECTS OF ACTIONS
+    	for (int i=0; i<facts_table_size; i++) {
+    		for (int j=0; j<ops_table_size; j++) {
+    			if (ops_table.get(j).getNegativeEffect().get(i)) {
+    				isEffect = true;
+    			}
+    		}
+    		if (isEffect) {
+    			for (int t=0; t<get_numTimeSteps(); t++) {
+    				sol = new ArrayList<Integer>();
+    				sol.add(-findDimacsIdFact(i, t));
+    				sol.add(findDimacsIdFact(i, t+1));
+    				for (int j=0; j<ops_table_size; j++) {
+    	    			if (ops_table.get(j).getNegativeEffect().get(i)) {
+    	    				sol.add(findDimacsIdOperationRegularEncoding(j, t));
+    	    			}
+    	    		}
+    				int[] mat = new int[sol.size()];
+    				for (int l=0; l<sol.size(); l++) {
+    					mat[l] = sol.get(l);
+    				}
+    				clause = new VecInt(mat);
+					solver.addClause(clause);
+						//System.out.println(clause);
+    			}
+    		}					
+    	}
+    	// STAGE 5 (Complete Exclusion Axioms):
+    	for (int i=0; i<get_numTimeSteps(); i++) {
+    		for (int j=0; j<ops_table_size; j++) {
+    			for (int k=j+1; k<ops_table_size; k++) {
+    				clause = new VecInt(new int[]{-findDimacsIdOperationRegularEncoding(j, i),
+    												-findDimacsIdOperationRegularEncoding(k, i)});
+					solver.addClause(clause);
+						//System.out.println(clause);
+    			}
+    		}	
+        }
+		
+<<<<<<< .mine
+    	System.out.println("########## TIME USED TO ENCODE: " 
+								+ (System.nanoTime() - currentTimeNano)/1000000 + " ms ##########");
+		currentTimeNano = System.nanoTime();
+		System.out.println();
+		
+=======
+    	//Time
+    	if (this.dispTime){
+    		Main_DimacsCNF.displayTime("ENCODING", (System.nanoTime() - startTime)/1000000);
+    		startTime = System.nanoTime();
+    	}
+//    	System.out.println("############# AFTER ENCODING " + (System.nanoTime() - startTime)/1000000);
+    	
+>>>>>>> .r41
+    	IProblem problem = solver;
+		if (problem.isSatisfiable()) {
+			System.out.println("*** THE PROBLEM IS SATISFIABLE! ***");
+			System.out.println();
+			System.out.println("The proposed solution is the following:");
+			System.out.println();
+			// We create a table of integers which holds the solution.
+			// It contains positive and negative integers.
+			mysolution = problem.findModel();
+			
+<<<<<<< .mine
+			System.out.println("########## TIME USED TO SOLVE: " 
+					+ (System.nanoTime() - currentTimeNano)/1000000 + " ms ##########");
+			currentTimeNano = System.nanoTime();
+			System.out.println();
+=======
+			//Time
+			if (this.dispTime){
+	    		Main_DimacsCNF.displayTime("SOLVING", (System.nanoTime() - startTime)/1000000);
+	    		startTime = System.nanoTime();
+	    	}
+//			System.out.println("############# AFTER SOLVING " + (System.nanoTime() - startTime)/1000000);
+>>>>>>> .r41
+			
+			///////////////////////////////////////////////////////////////////
+			// We translate the solution into an understandable form of a plan.
+			this.translateSolutionRegularEncoding(mysolution);
+			///////////////////////////////////////////////////////////////////
+			
+<<<<<<< .mine
+			System.out.println("########## TIME USED TO DECODE: " 
+					+ (System.nanoTime() - currentTimeNano)/1000000 + " ms ##########");
+			currentTimeNano = System.nanoTime();
+			System.out.println();
+=======
+			//Time
+			if (this.dispTime){
+	    		Main_DimacsCNF.displayTime("DECODING", (System.nanoTime() - startTime)/1000000);
+	    		startTime = System.nanoTime();
+	    	}
+//			System.out.println("############# AFTER DECODING " + (System.nanoTime() - startTime)/1000000);
+>>>>>>> .r41
+			
+        } else {
+            System.out.println("%%% THE PROBLEM IS UNSATISFIABLE %%%");
+            
+            System.out.println("########## TIME USED TO DECLERE THE UNDECIDABILITY: " 
+					+ (System.nanoTime() - currentTimeNano)/1000000 + " ms ##########");
+			currentTimeNano = System.nanoTime();
+			System.out.println();
+        }
+		
+		return;
+    } 
+    
+
+    /**
+     * ACTIONS ENCODING (option 2): -----------SIMPLE OPERATOR SPLITTING------------
+     * Encodes the actions of the problem using the method of Simple-Operator-Splitting.
+     * @return
+     * 		An ArrayList of the propositions which correspond to the encoding of actions
+     * 		(the method of Simple-Operator-Splitting is used).
+     * @throws ContradictionException, TimeoutException 
+     */
+    public void encodeActionsSimpleOpSplitting() throws ContradictionException, TimeoutException {
+    	
+    	final int MAXVAR = 1000000;
+		final int NBCLAUSES = 500000;
+		
+		ISolver solver = SolverFactory.newDefault();
+		//  prepare the solver to accept MAXVAR variables. MANDATORY
+		solver.newVar(MAXVAR);
+		// not mandatory for SAT solving. MANDATORY for MAXSAT solving
+		solver.setExpectedNumberOfClauses(NBCLAUSES);
+		// Feed the solver using Dimacs format, using arrays of int
+		// (best option to avoid dependencies on SAT4J IVecInt)
+		
+		/**
+		 * We will use this variable in order to build all necessary clauses (one by one).
+		 */
+		VecInt clause;
+    	
+    	// STAGE 1 (Initial State):
+		System.out.println("INITIAL POSITION");
+    	List<InitEl> inlist = problem.getInit();
+    	for (int i=0; i<facts_table.size(); i++) { // for each fact
+    		boolean isInit = false;
+    		for (int j=0; j<inlist.size(); j++) { // for each "element" of the initial state...
+    		
+        		if (facts_table.get(i).equals(inlist.get(j))) { // Find its "matching" entry in the facts table...
+        			clause = new VecInt(new int[]{findDimacsIdFact(i, 0)});
+        			solver.addClause(clause);
+        				//System.out.println(clause);
+        			isInit = true ;
+        			continue;
+        		} 
+    		}
+    		if (!isInit){
+    			clause = new VecInt(new int[]{-findDimacsIdFact(i, 0)});
+    			solver.addClause(clause);
+    				//System.out.println(clause);
+    		}
+    	}
+    	System.out.println("GOAL POSITION");
+    	// STAGE 2 (Goal State):
+    	BitSet bs = goals[0]; // The positive preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			clause = new VecInt(new int[]{findDimacsIdFact(i, num_steps_inPlan)});
+    			solver.addClause(clause);
+    				//System.out.println(clause);
+    		}
+    	}
+    	bs = goals[1]; // The negative preconditions of the goal
+    	for (int i=0; i<bs.length(); i++) {
+    		if (bs.get(i)) {
+    			clause = new VecInt(new int[]{-findDimacsIdFact(i, num_steps_inPlan)});
+    			solver.addClause(clause);
+    				//System.out.println(clause);
+    		}
+    	}
+    	
+    	System.out.println("ACTIONS");
+    	
+    	// Stage 3 (Actions Encoding - SIMPLE OPERATOR SPLITTING):
+    	int totalDimacsIdsFact = this.findTotalDimacsIdsFact();
+    	// The basic ArrayList (encodingAllActionsHelper) which contains an ArrayList for each action with a different name.
+    	// For example, in the blocksworld, we have the basic ArrayList (encodingAllActionsHelper) that contains 4 ArrayLists,
+    	// which correspond to the actions: pickup, putdown, stack and unstack.
+    	ArrayList<ArrayList> encodingAllActionsHelper = new ArrayList<ArrayList>();
+    	// We remember the name of the previous action, in order to avoid creating a new ArrayList for the next action
+    	// if the two share the same name.
+    	String previousOpName = "";
+    	// Each time that this ArrayList is properly built, it represents an action with a specific name (eg. stack).
+    	// These ArrayLists are the elements of the encodingAllActionsHelper ArrayList.
+    	ArrayList<HashMap> encodingOneActionHelper = null;
+    	// This variable will be equal to the total number of different ints that are used in order to
+    	// encode all split actions of a same timestep.
+    	// It is used in every step in order to give a different encoding number to a (split) action.
+    	int dimacsNum = 0;
+    	// The encodedActions ArrayList will be used in the following way:
+    	// Each element is an ArrayList that corresponds to a grounded action for the first timestep.
+    	// Those (inner) ArrayLists contain the dimacs numbers of that grounded action (for the first timestep).
+    	// The encoding of actions of other timesteps is based on this ArrayList,
+    	// so we don't need to generate any other ArrayLists.
+    	ArrayList<ArrayList> encodedActions = new ArrayList<ArrayList>();
+    	// The inner ArrayList that contains the dimacs numbers of a grounded action.
+    	ArrayList<Integer> encoded = null;
+    	
+    	// We have to test for each grounded action, if there is the need to create an (encoded) ArrayList.
+    	for (int i=0; i<this.ops_table_size; i++) {
+    		
+    		Op currOp = this.ops_table.get(i);
+    		int OpArity = currOp.getName().getArity();
+    		// As we are proceeding to the construction of the hashmaps, in the same time,
+    		// we will encode each action by associating it with an ArrayList of integers
+    		//////////////////////////////////////
+    		encoded = new ArrayList<Integer>(); 
+    		//////////////////////////////////////
+    		
+    		// If we got an action with a different name than the previous,
+    		// then we must create an ArrayList of HashMaps for this new action
+    		if ( !currOp.getName().getPredicate().toString().equals(previousOpName) ) {
+    			// remember for next iteration...
+    			previousOpName = currOp.getName().getPredicate().toString();
+    			// Create the ArrayList for this action.
+    			encodingOneActionHelper = new ArrayList<HashMap>();
+    			for (int j=0; j<OpArity; j++) {
+    				encodingOneActionHelper.add(new HashMap<String, Integer>());
+    			}
+    			// Continue the "construction" of the basic ArrayList (encodingAllActionsHelper).
+    			encodingAllActionsHelper.add(encodingOneActionHelper);
+    		}
+    		// Now for each term of the currOp we have to find a corresponding number, with the help of 
+    		// the corresponding HashMap, and (if it is a new one) we have to add this correspondence
+    		// to the HashMap.
+    		Iterator it = currOp.getName().iterator();
+    		int index = 0;
+    		
+    		while (it.hasNext()) {
+    			// Check the proper HashMap. If the key has been used we can use its corresponding value.
+    			// If there is no such key, we insert a new pair in the HashMap.
+    			HashMap<Term, Integer> hmap = encodingOneActionHelper.get(index);
+    			Term key = (Term)it.next();        // whether this or "... .toString()"
+    			if ( !hmap.containsKey(key) ) {
+    				dimacsNum++;
+    				hmap.put(key, dimacsNum);
+    				////////////////////////
+    				encoded.add(totalDimacsIdsFact + dimacsNum); // negative! (??)
+    				////////////////////////	
+    			} else {
+    				/////////////////////////////
+    				encoded.add(totalDimacsIdsFact + hmap.get(key));  // negative! (??)
+    				/////////////////////////////
+    			}
+    			index++;	
+			} // end-while
+    		encodedActions.add(encoded);
+    	} // end-for (each action)
+    	// We can now save the size of the ArrayList we constructed in order to use it later.
+    	int encodedActionsSize = encodedActions.size();
+    	
+    	// check the results
+    	System.out.println("******************************************************");
+    	System.out.println(encodingAllActionsHelper);
+    	System.out.println(this.findTotalDimacsIdsFact());
+    	System.out.println();
+    	System.out.println(encodedActions);
+    	System.out.println("******************************************************");
+    	
+    	/////////// ArrayList<VecInt> answer = new ArrayList<VecInt>(); (maybe used if the function is broken in pieces)
+    	
+    	/////////// BitSet bs = null; // BitSet
+    	/////////// VecInt clause = null; // VecInt
+    	
+    	/*
+    	// The FACTS TABLE
+    	for (int i=0; i<this.facts_table_size; i++) {
+    		System.out.println(this.facts_table.get(i));///////
+    		//System.out.println(facts_table.get(i));///////
+    	}
+    	*/
+    	
+    	for (int i=0; i<ops_table_size; i++) {
+    		//System.out.println(ops_table.get(i).getName());///////
+    		for (int j=0; j<num_steps_inPlan; j++) {
+    			//  For the POSITIVE PRECONDITIONS of actions...
+    			bs = ops_table.get(i).getPositivePreconditon();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					int[] mat = new int[encodedActions.get(i).size()+1];
+        				for (int l=0; l<encodedActions.get(i).size(); l++) {
+        					mat[l] = -( (Integer) encodedActions.get(i).get(l) + dimacsNum*j );	
+        				}
+        				mat[encodedActions.get(i).size()] = findDimacsIdFact(k, j);
+        				clause = new VecInt(mat);
+        				//answer.add(clause);
+            			solver.addClause(clause);
+    	    				//System.out.println(clause);///////
+    				}
+    			}
+    			//  For the NEGATIVE PRECONDITIONS of actions...
+    			bs = ops_table.get(i).getNegativePrecondition();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					int[] mat = new int[encodedActions.get(i).size()+1];
+        				for (int l=0; l<encodedActions.get(i).size(); l++) {
+        					mat[l] = -( (Integer) encodedActions.get(i).get(l) + dimacsNum*j );	
+        				}
+        				mat[encodedActions.get(i).size()] = -findDimacsIdFact(k, j);
+        				clause = new VecInt(mat);
+        				//answer.add(clause);
+        				solver.addClause(clause);
+    	    				//System.out.println(clause);
+    				}
+    			}
+    			//  For the POSITIVE EFFECTS of actions...
+    			bs = ops_table.get(i).getPositiveEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					int[] mat = new int[encodedActions.get(i).size()+1];
+        				for (int l=0; l<encodedActions.get(i).size(); l++) {
+        					mat[l] = -( (Integer) encodedActions.get(i).get(l) + dimacsNum*j );	
+        				}
+        				mat[encodedActions.get(i).size()] = findDimacsIdFact(k, j+1); ///// !
+        				clause = new VecInt(mat);
+        				//answer.add(clause);
+        				solver.addClause(clause);
+    	    				//System.out.println(clause);
+    				}
+    			}
+    			//  For the NEGATIVE EFFECTS of actions...
+    			bs = ops_table.get(i).getNegativeEffect();
+    			for (int k=0; k<bs.length(); k++) {
+    				if (bs.get(k)) {
+    					int[] mat = new int[encodedActions.get(i).size()+1];
+        				for (int l=0; l<encodedActions.get(i).size(); l++) {
+        					mat[l] = -( (Integer) encodedActions.get(i).get(l) + dimacsNum*j );	
+        				}
+        				mat[encodedActions.get(i).size()] = -findDimacsIdFact(k, j+1);  ////  !
+        				clause = new VecInt(mat);
+        				//answer.add(clause);
+        				solver.addClause(clause);
+    	    				//System.out.println(clause);
+    				}
+    			}
+    		}	
+    	}
+    	
+    	System.out.println("FRAME AXIOMS");
+    	
+    	// STAGE 4 (Frame Axioms):
+    	// For the POSITIVE EFFECTS OF ACTIONS, and also,
+    	// for the NEGATIVE EFFECTS OF ACTIONS.
+    	for (int i=0; i<this.facts_table_size; i++) {
+    		// The actionsWithPosEff ArrayList contains (in the form of ArrayLists) all the actions
+    		// which have the current fact to their POSITIVE EFFECTS.
+    		ArrayList<ArrayList> actionsWithPosEff = new ArrayList<ArrayList>();
+    		// The actionsWithNegEff ArrayList contains (in the form of ArrayLists) all the actions
+    		// which have the current fact to their NEGATIVE EFFECTS.
+    		ArrayList<ArrayList> actionsWithNegEff = new ArrayList<ArrayList>();
+    		// Fill the ArrayLists we just created with the proper data.
+    		for (int j=0; j<this.ops_table_size; j++) {
+    			// build the Arraylist for the positive effects.
+    			if (this.ops_table.get(j).getPositiveEffect().get(i)) {
+    				actionsWithPosEff.add(encodedActions.get(j));
+    					//System.out.println(this.ops_table.get(j).getName());
+    					//System.out.println(encodedActions.get(j));
+    					//System.exit(0);
+    				//System.out.println(this.ops_table.get(j).getName() +  " *** " + j);	
+    			}
+    			// build the Arraylist for the negative effects.
+    			if (this.ops_table.get(j).getNegativeEffect().get(i)) {
+    				actionsWithNegEff.add(encodedActions.get(j));
+    				//System.out.println(this.ops_table.get(j).getName() +  " *** " + j);	
+    			}
+    		}
+    		/*
+    		// Test the 2 ArrayLists we constructed.
+    		System.out.println();
+    		System.out.println(this.facts_table.get(i));
+    		System.out.println(actionsWithPosEff);
+    		System.out.println(actionsWithNegEff);
+    		System.out.println();
+    		//System.exit(0);
+    		*/
+    		//////////////////////////////////////////////
+    		
+    		// The following "set of pointers" will help us find the result we search for.
+    		// In order to encode the positive effects of actions we will have to obtain
+    		// all the possible combinations of basic elements of the actionsWithPosEff ArrayList.
+    		// The pointers[] variable will help accomplish this task.
+    		// It contains actionsWithPosEff.size() "pointers",
+    		// one for every action of the actionsWithPosEff ArrayList.
+    		int[] pointers = new int[actionsWithPosEff.size()];
+    		for (int j=0; j<pointers.length; j++) {
+    			pointers[j] = 0;
+    		}
+    		// If there is a "pointer" who is not "depleted", then
+    		// the value of the pointerNotDepleted variable will be set to true; 
+    		boolean posEffPointerNotDepleted;
+    		boolean negEffPointerNotDepleted;
+    		
+    		// For each timestep... 
+    		for (int t=0; t<this.num_steps_inPlan; t++) {
+    			
+    			System.out.println();
+    			System.out.println("FACT: " + this.facts_table.get(i));
+    			System.out.println(actionsWithPosEff);
+        		System.out.println(actionsWithNegEff);
+    			System.out.println("TIMESTEP: " + t);
+    			System.out.println();
+    			System.out.println("POSITIVE EFFECTS...");
+    			
+    			posEffPointerNotDepleted = true;
+    			// A loop will give a different combination of the inner elements,
+    			// which is a clause on the dimacs format.
+    			while (posEffPointerNotDepleted) {
+    					//System.out.println("KKK");
+    				// The resulting piece of info needed for the solver.
+    				// We don't compute the number of combinations, so we use an ArrayList.
+    				// At the end, we will construct an int[] from this ArrayList.
+    				ArrayList res = new ArrayList();
+    				// Put the fact we are examining (POS - NEG: Because of negation...)
+    				res.add(this.findDimacsIdFact(i, t));
+    				res.add(-this.findDimacsIdFact(i, t+1));
+    				// Put the current combination using the pointers[] variable.
+    				for (int k=0; k<pointers.length; k++) {
+    					res.add( (Integer)actionsWithPosEff.get(k).get(pointers[k]) + dimacsNum*t);
+    				}
+    					//System.out.println(res);
+    					//System.exit(0);
+    				// Now we have to manipulate the pointers[] in order to be ready 
+    				// to get the next combination in the next loop of the while,
+    				// or to realise that there exist no more combinations. So...
+    				// IF THE FIRST POINTER HAS REACHED ITS END...
+    				if (pointers[0]==actionsWithPosEff.get(0).size()-1) {
+    					// We reset the pointer to (0).
+    					pointers[0] = 0;
+    					// Now, work for the other pointers...
+    					// If the following for loop doesn't change the value of the boolean variable,
+    					// that means that all combinations have been computed
+    					// (we are in the last combination).
+    					posEffPointerNotDepleted = false;
+    					for (int m=1; m<pointers.length && !posEffPointerNotDepleted; m++) {
+    						// Reset to zero only pointers which form a "group"
+    						// after the first pointer.
+    						if (pointers[m] == actionsWithPosEff.get(m).size()-1) {
+    							pointers[m] = 0;
+    						}
+    						else  { // if another pointer has not been depleted
+    							// properly set its value.
+    							pointers[m]++;
+    							// We want to be able to continue the while loop.
+    							posEffPointerNotDepleted = true;
+    						}
+    					}
+    				} else { // We increase the number of the first pointer
+    					pointers[0]++;
+    				}
+    				/////////////////////////
+    				//System.out.println(res);
+    				int[] mat= new int[res.size()];
+    				for (int x=0; x<res.size(); x++) {
+    					mat[x] = (Integer)res.get(x);
+    				}
+    				clause = new VecInt(mat);
+    					//System.out.println(clause);
+        			solver.addClause(clause);
+    				/////////////////////////
+    			} //end-while
+    			//System.exit(0);
+
+    			///////////////////////////////////////////////////////////////////////////////
+    			//System.out.println();
+    			//System.out.println("... AND NEGATIVE EFFECTS");
+    			//System.out.println();
+    			///////////////////////////////////////////////////////////////////////////////
+    			// Then do the NEGATIVE EFFECTS OF ACTIONS.
+    			pointers = new int[actionsWithNegEff.size()];
+    			negEffPointerNotDepleted = true;
+    			while (negEffPointerNotDepleted) {
+    				ArrayList res = new ArrayList();
+    				// Put the fact we are examining (POS - NEG: Because of negation...)
+    				res.add(-this.findDimacsIdFact(i, t));
+    				res.add(this.findDimacsIdFact(i, t+1));
+    				// Put the current combination using the pointers[] variable.
+    				for (int k=0; k<pointers.length; k++) {
+    					res.add((Integer)actionsWithNegEff.get(k).get(pointers[k]) + dimacsNum*t);
+    				}
+
+    				if (pointers[0]==actionsWithNegEff.get(0).size()-1) {
+    					// We reset the pointer to (0).
+    					pointers[0] = 0;
+    					// Now, work for the other pointers...
+    					negEffPointerNotDepleted = false;
+    					for (int m=1; m<pointers.length && !negEffPointerNotDepleted; m++) {
+    						// Reset to zero only pointers which form a "group"
+    						// after the first pointer.
+    						if (pointers[m] == actionsWithNegEff.get(m).size()-1) {
+    							pointers[m] = 0;
+    						}
+    						else  { // if another pointer has not been depleted
+    							// properly set its value.
+    							pointers[m]++;
+    							// We want to be able to continue the while loop.
+    							negEffPointerNotDepleted = true;
+    						}
+    					}
+    				} else { // We increase the number of the first pointer
+    					pointers[0]++;
+    				}
+    				//System.out.println(res);
+    				int[] mat= new int[res.size()];
+    				for (int x=0; x<res.size(); x++) {
+    					mat[x] = (Integer)res.get(x);
+    				}
+    				clause = new VecInt(mat);
+    					//System.out.println(clause);
+        			solver.addClause(clause);
+    			} //end-while
+    		}// end-for (each timestep)
+    	}
+    	
+    	System.out.println("COMPLETE EXCLUSION AXIOMS");
+    	
+    	// STAGE 5 (Complete Exclusion Axioms):
+    	for (int t=0; t<this.num_steps_inPlan; t++) { // do for every timestep
+    		// No two actions can happen at the same time.
+    		for (int i=0; i<encodedActionsSize; i++) {
+    			for (int j=i+1; j<encodedActionsSize; j++) {
+
+    				ArrayList a = encodedActions.get(i);
+    				ArrayList b = encodedActions.get(j);
+    				// Now do this for each timestep...
+    				//for (int k=0; k)
+
+    				int[] mat = new int[a.size() + b.size()];
+    				// Fill half the data of a clause
+    				for (int l=0; l<a.size(); l++) {
+    					mat[l] = -((Integer)a.get(l) + dimacsNum*t);
+    					//System.out.println(mat[l]);
+    				}
+    				// Fill th other half of the clause
+    				for (int l=0; l<b.size(); l++) {
+    					mat[a.size()+l] = -((Integer)b.get(l)+ dimacsNum*t);
+    					//System.out.println(mat[a.size()+l]);
+    				}
+    				clause = new VecInt(mat);
+    				//answer.add(clause);
+    				solver.addClause(clause);
+    					//System.out.println(clause);
+    			}
+    		}
+    	}
+    	
+    	IProblem problem = solver;
+		if (problem.isSatisfiable()) {
+			System.out.println("*** THE PROBLEM IS SATISFIABLE! ***");
+			System.out.println();
+			System.out.println("The proposed solution is the following:");
+			System.out.println();
+			// We create a table of integers which holds the solution.
+			// It contains positive and negative integers.
+			int[] mysolution = problem.findModel();
+			for (int i=0; i<mysolution.length;i++) {
+				System.out.println(mysolution[i]);
+			}
+			
+        } else {
+            System.out.println("%%% THE PROBLEM IS UNSATISFIABLE %%%");
+        }
+		
+    	
+    	
+    	
+    	/////return answer; 
+    	return;
+    }
+
+
+    /**
+     * Translates the solution under the form of an array of integers, into an array of Strings
+     * which represents the actual steps of the plan in an understandable format.
+     * @param solution
+     */
+    public void translateSolutionRegularEncoding(int[] solution) {
+    	/**
+    	 * The length of the array is equal to the total number of steps in the plan.
+    	 * answer[i] corresponds to the i action of the plan. 
+    	 */
+    	String[] answer = new String[get_numTimeSteps()];
+    	for (int i=0; i<solution.length; i++) {
+    		int totalfacts = findTotalDimacsIdsFact();
+    		if (solution[i] > totalfacts) {
+    			// solution[i] corresponds to an action which must be executed in our plan (positive).
+    			// It is not a fact.
+    			// The division is used to find which is the action (according to the ops_table variable).
+    			int act = ( solution[i] - totalfacts ) / this.get_numTimeSteps();
+    			// The modulo is used to find the timestep of the action.
+    			int time = ( solution[i]- totalfacts ) % this.get_numTimeSteps();
+    			// Translation in case of time != 0
+    			if (time != 0) {
+    				String firstPart = "TIMESTEP " + time;
+	    			String secondPart = ops_table.get(act).getName().toString();
+	    			String answerElem = firstPart + " --> " + secondPart;
+	    			answer[time-1] = answerElem;
+    			} else { // If time == 0, we must be careful when translating.
+    				String firstPart = "TIMESTEP " + get_numTimeSteps(); // It's the last action
+    				String secondPart = ops_table.get(act-1).getName().toString();
+	    			String answerElem = firstPart + " --> " + secondPart;
+	    			answer[get_numTimeSteps()-1] = answerElem;
+    			}
+    		}	
+    	}
+    	// Fill the remaining slots of the array with a "DO NOTHING" value which corresponds
+    	// to all timesteps where we have no action.
+    	for (int i=0; i<answer.length; i++) {
+    		if (answer[i] == null) {
+    			answer[i] = "TIMESTEP " + (i+1) + " --> " + "DO NOTHING";
+    		}
+    	}
+    	// Print the solution we found.
+    	for (int i=0; i<answer.length; i++) {
+    		System.out.println(answer[i]);
+    	}
+    	
+    	System.out.println();
+    	return;
+    }
+    
+	/**
+     * @param fact_id : the position of the fact in the facts table.
+     * @param timestep : The timestep in which the fact is having place.
+     * @return
+     */
+    private int findDimacsIdFact(int fact_id, int timestep) {
+    	// We use (timestep+1) since we begin by giving the id 1 (and not 0) to the first fact.
+		return ( fact_id*(num_steps_inPlan+1) + (timestep+1) );
+	} 
+    
+    /**
+     * Used only for the regular encoding of actions.
+     * @param op_id : the position of the operation in the operations table.
+     * @param timestep : The timestep in which the operation is having place.
+     * @return
+     */
+    private int findDimacsIdOperationRegularEncoding(int op_id, int timestep) {
+		return ( findTotalDimacsIdsFact() + op_id*(num_steps_inPlan) + (timestep+1) );  
+	}
+    
+    /**
+     * Returns the total number of Dimacs Ids for all the facts.
+     */
+    private int findTotalDimacsIdsFact() {
+		return (facts_table_size)*(num_steps_inPlan + 1);
+	}
+    
+    /**
+     * Used only for the regular encoding of actions.
+     * Returns the total number of Dimacs Ids for all the operations.
+     */
+    private int findTotalDimacsIdsOperationRegularEncoding() {
+		return (ops_table_size)*(num_steps_inPlan);
+	}
+
+	/**
+	 * Used only for the regular encoding of actions.
+     * Returns the total number of Dimacs Ids 
+     * given to all facts and all operations (for all timesteps). 
+     * @return
+     */
+    public int findTotalDimacsIdsRegularEncoding() {
+    	return (facts_table_size)*(num_steps_inPlan + 1) + 
+    			(ops_table_size)*(num_steps_inPlan);	
+    }
+    
+    /**
+     * Returns the number of time steps that we use in order to find a solution.
+     * @return
+     */
+    public int get_numTimeSteps() {
+    	return num_steps_inPlan;
+    }
+    
+    /**
+     * Sets the number of time steps that we use in order to find a solution.
+     * @return
+     */
+    public void set_numTimeSteps(int n) {
+    	num_steps_inPlan = n; 
+    }
+    
+    
+//	/**
+//	 * Encode a BitSet of a positive predicates conjunction to a list of the respective dimacs numbers.
+//	 * @param bs Positives predicates BitSet.
+//	 * @param stateNumber Represents the state of this predicate.
+//	 * @return Integer list, each integer is a dimacs number.
+//	 */
+//	public List<Integer> encodePositiveDimacsPredicates(BitSet bs, int stateNumber){
+//		List<Integer> l = new ArrayList<Integer>();
+//		for (int i = 0; i < bs.size(); i++) {
+//			if (bs.get(i)==true){
+//				l.add(i*num_steps_inPlan+stateNumber+1);
+//			}
+//		}
+//		return l;
+//	}
+//	
+//	/**
+//	 * Encode a BitSet of a positive actions conjunction to a list of the respective dimacs numbers.
+//	 * @param bs Positives actions BitSet.
+//	 * @param stateNumber Represents the state of this predicate.
+//	 * @return Integer list, each integer is a dimacs number.
+//	 */
+//	public List<Integer> encodePositiveDimacsAction(BitSet bs, int stateNumber){
+//		List<Integer> l = new ArrayList<Integer>();
+//		for (int i = 0; i < bs.size(); i++) {
+//			if (bs.get(i)==true){
+//				l.add(i*num_steps_inPlan+stateNumber+1+facts_table_size*num_steps_inPlan);
+//			}
+//		}
+//		return l;
+//	}
+//
+//	/**
+//	 * Encode a BitSet of a negative predicates conjunction to a list of the respective dimacs numbers.
+//	 * @param bs Negatives predicates BitSet.
+//	 * @param stateNumber Represents the state of this predicate.
+//	 * @return Integer list, each integer is a dimacs number.
+//	 */
+//	public List<Integer> encodeNegativeDimacsPredicates(BitSet bs, int stateNumber){
+//		List<Integer> l = new ArrayList<Integer>();
+//		for (int i = 0; i < bs.size(); i++) {
+//			if (bs.get(i)==true){
+//				l.add((i*num_steps_inPlan+stateNumber-1)*(-1));
+//			}
+//		}
+//		return l;
+//	}
+//	
+//	/**
+//	 * Encode a BitSet of a negative actions conjunction to a list of the respective dimacs numbers.
+//	 * @param bs Negatives actions BitSet.
+//	 * @param stateNumber Represents the state of this predicate.
+//	 * @return Integer list, each integer is a dimacs number.
+//	 */
+//	public List<Integer> encodeNegativeDimacsAction(BitSet bs, int stateNumber){
+//		List<Integer> l = new ArrayList<Integer>();
+//		for (int i = 0; i < bs.size(); i++) {
+//			if (bs.get(i)==true){
+//				l.add((i*num_steps_inPlan+stateNumber-1-facts_table_size*num_steps_inPlan)*(-1));
+//			}
+//		}
+//		return l;
+//	}
+//	
+	/**
+	 * Decode a dimacs number into an Integer list.<br>
+	 * The first number means :<br>
+	 * 0 for a fact.<br>
+	 * 1 for an action.<br>
+	 * The second number is the index in the right list (fact or action) of this element.
+	 * The last number is the state number of this element.
+	 * @param dimacsNumber Number from the dimacs file.
+	 * @return An Integer list.
+	 */
+	public ArrayList<Integer> decodeDimacsNumber(int dimacsNumber){
+		ArrayList<Integer> l = new ArrayList<Integer>();
+		
+		//First part : the number is a fact
+		if ( (dimacsNumber>0) && (dimacsNumber<(num_steps_inPlan+1)*facts_table_size+1) ){
+			l.add(0);
+			l.add( (dimacsNumber-1) / (num_steps_inPlan+1) );
+			l.add( (dimacsNumber-1) % (num_steps_inPlan+1) );			
+		}
+		else if( (dimacsNumber<0) && (dimacsNumber > (-1) * ((num_steps_inPlan+1)*facts_table_size) -1) ){
+			l.add(0);
+			l.add( Math.abs( (dimacsNumber+1) / (num_steps_inPlan+1) ) );
+			l.add( Math.abs( (dimacsNumber+1) % (num_steps_inPlan+1) ) );	
+		}
+		
+		//Second part : the number is an action
+		else if (dimacsNumber>(num_steps_inPlan+1)*facts_table_size){
+			dimacsNumber -= (num_steps_inPlan+1)*facts_table_size+1;
+			l.add(1);
+			l.add( (dimacsNumber) / (num_steps_inPlan) );
+			l.add( (dimacsNumber) % (num_steps_inPlan) );
+		}
+		else if (dimacsNumber < (-1)*((num_steps_inPlan+1)*facts_table_size)){
+			dimacsNumber += (num_steps_inPlan+1)*facts_table_size+1;
+			l.add(1);
+			l.add( Math.abs( (dimacsNumber) / (num_steps_inPlan) ) );
+			l.add( Math.abs( (dimacsNumber) % (num_steps_inPlan) ) );
+		}
+		
+		//Third part : the number is 0 => not a Dimacs Number
+		else {
+			System.out.println("Error");
+		}
+		return l;
+	}
+	
+	public void showDetailsSolution(int[] solution){
+		System.out.println("\n\n Test traduction \n\n");
+		int [] test = solution;
+		for (int i : test) {
+			ArrayList<Integer> dec = this.decodeDimacsNumber(i);
+			if (dec.get(0)==0){
+				System.out.println(dec.get(0)+";"+dec.get(1)+";"+dec.get(2)+";");
+				if (i>0){
+					System.out.println(i+" : "+ this.facts_table.get(dec.get(1)).toString() +"_"+dec.get(2)+"\n");						
+				}
+				else{
+					System.out.println(i+" : NOT "+ this.facts_table.get(dec.get(1)).toString() +"_"+dec.get(2)+"\n");												
+				}
+			}
+			else if (dec.get(0)==1){
+				System.out.println(dec.get(0)+":"+dec.get(1)+":"+dec.get(2)+":");
+				if (i>0){
+					System.out.println(i+" : "+ this.ops_table.get(dec.get(1)).getName().toString() +"_"+dec.get(2)+"\n");						
+				}
+				else {
+					System.out.println(i+" : DON'T DO "+ this.ops_table.get(dec.get(1)).getName().toString() +"_"+dec.get(2)+"\n");						
+				}
+			}
+		}
+	}
+
+	public synchronized boolean isDispTime() {
+		return dispTime;
+	}
+
+	public synchronized void setDispTime(boolean dispTime) {
+		this.dispTime = dispTime;
+	}
+       
+}
